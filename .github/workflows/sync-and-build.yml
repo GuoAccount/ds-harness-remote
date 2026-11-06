@@ -1,0 +1,151 @@
+name: Sync upstream & build ARM64 server image
+
+# 定时从上游 liguobao/ds-harness-remote 同步 main 与 tags，
+# 当 apps/server 或 packages/protocol 有变化时构建 linux/arm64 镜像推送到 GHCR。
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 即使构建输入未变也强制重建镜像
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-and-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: liguobao/ds-harness-remote
+  IMAGE: ghcr.io/guoaccount/ds-harness-remote/server
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      head_sha: ${{ steps.diff.outputs.head_sha }}
+      cache_key: ${{ steps.diff.outputs.cache_key }}
+      server_version: ${{ steps.diff.outputs.server_version }}
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward main and tags from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 记录同步前的 main，用于判断本次是否引入了服务端变更
+          PREV=$(git rev-parse HEAD)
+          echo "prev_sha=$PREV" >> "$GITHUB_OUTPUT"
+
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream main --tags --force
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            git reset --hard upstream/main
+          else
+            echo "::warning::上游 main 与 fork 分叉（可能有本地提交），改为 merge"
+            git merge --no-edit upstream/main
+          fi
+          git push origin HEAD:main --force-with-lease
+          git push origin --tags --force
+
+      - name: Detect build-relevant changes
+        id: diff
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "server_version=$(node -p "require('./apps/server/package.json').version")" >> "$GITHUB_OUTPUT"
+
+          # 构建上下文的指纹：Dockerfile + 服务端/协议源码 + 锁文件 + workspace 清单
+          KEY=$(git ls-tree -r HEAD -- \
+                apps/server packages/protocol \
+                package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json \
+              | sha256sum | cut -d' ' -f1)
+          echo "cache_key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PREV="${{ steps.sync.outputs.prev_sha }}"
+          if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
+            if git diff --quiet "$PREV" HEAD -- apps/server packages/protocol package.json pnpm-lock.yaml pnpm-workspace.yaml; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "构建输入无变化，跳过镜像构建"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "检测到服务端相关变更"
+            fi
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "无历史构建记录，执行首次构建"
+          fi
+
+  build:
+    name: Build linux/arm64 image
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.force_build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out synced revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ needs.sync.outputs.server_version }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/server/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server-arm64
+          cache-to: type=gha,mode=max,scope=server-arm64
+
+      - name: Summary
+        run: |
+          {
+            echo "### ARM64 镜像已推送"
+            echo ""
+            echo "- 镜像：\`${{ env.IMAGE }}:latest\`"
+            echo "- 服务端版本：\`${{ needs.sync.outputs.server_version }}\`"
+            echo "- 提交：\`${{ needs.sync.outputs.head_sha }}\`"
+            echo "- 构建输入指纹：\`${{ needs.sync.outputs.cache_key }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
