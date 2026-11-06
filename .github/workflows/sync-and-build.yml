@@ -52,46 +52,44 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM}.git"
           git fetch upstream main --tags --force
 
-          # 备份本工作流文件，重置后原样放回，保证 main 永远是「上游 + 1 个提交」
+          # 备份本工作流，重置后放回，保证 main = 上游 main + 本工作流一个提交。
+          # 注意：reset 后该文件是 untracked，git diff 对 untracked 无感，
+          # 所以是否推送必须用 tree 比对，不能用 git diff。
           cp "$WORKFLOW_FILE" /tmp/keep-workflow.yml
           git reset --hard upstream/main
           mkdir -p "$(dirname "$WORKFLOW_FILE")"
           cp /tmp/keep-workflow.yml "$WORKFLOW_FILE"
+          git add "$WORKFLOW_FILE"
 
-          if git diff --quiet -- "$WORKFLOW_FILE"; then
-            echo "工作流未变化，main 与上游一致，无需推送"
+          NEW_TREE=$(git write-tree)
+          OLD_TREE=$(git rev-parse "$PREV^{tree}")
+
+          if [ "$NEW_TREE" = "$OLD_TREE" ]; then
+            echo "内容与 fork main 完全一致，上游无更新"
             echo "synced=false" >> "$GITHUB_OUTPUT"
           else
-            git add "$WORKFLOW_FILE"
-            git commit -m "ci: 同步上游 $(git rev-parse --short upstream/main) 并保留 ARM64 构建工作流"
+            git commit -m "ci: 同步上游 $(git rev-parse --short upstream/main)"
             git push origin HEAD:main --force-with-lease
+            git push origin --tags --force
             echo "synced=true" >> "$GITHUB_OUTPUT"
           fi
-
-          git push origin --tags --force
 
       - name: Detect build-relevant changes
         id: diff
         run: |
           set -euo pipefail
-          HEAD_SHA=$(git rev-parse HEAD)
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "server_version=$(node -p "require('./apps/server/package.json').version")" >> "$GITHUB_OUTPUT"
 
           PREV="${{ steps.sync.outputs.prev_sha }}"
-          if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
-            if git diff --quiet "$PREV" HEAD -- \
-                 apps/server packages/protocol \
-                 package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json; then
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              echo "构建输入无变化，跳过镜像构建"
-            else
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-              echo "检测到服务端相关变更"
-            fi
+          if git diff --quiet "$PREV" HEAD -- \
+               apps/server packages/protocol \
+               package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "构建输入无变化，跳过镜像构建"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "无历史构建记录，执行首次构建"
+            echo "检测到服务端相关变更"
           fi
 
   build:
