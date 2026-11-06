@@ -70,8 +70,15 @@ jobs:
           else
             git commit -m "ci: 同步上游 $(git rev-parse --short upstream/main)"
             git push origin HEAD:main --force-with-lease
-            git push origin --tags --force
             echo "synced=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # tag 同步独立于 main 是否变化：上游可能只发 tag 不改 main。
+          # 单 tag 用 --force 覆盖（上游 tag 可能被移动），整体失败不影响已完成的 main 推送。
+          if git push origin --tags --force; then
+            echo "tags pushed"
+          else
+            echo "::warning::tag 同步失败（可能受分支保护或并发限制影响）"
           fi
 
       - name: Detect build-relevant changes
